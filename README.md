@@ -8,11 +8,11 @@ This custom node dramatically reduces VRAM usage for LTX-2 video generation in C
 
 LTX-2's FeedForward layers create massive intermediate tensors that normally limit video length. This node chunks those operations to reduce peak memory by up to **8x**, without any quality loss.
 
-| Without This Node | With V3 (ffn_chunks=16) |
-|-------------------|-------------------------|
-| ~300 frames max | **900 frames @ 1920x1088** |
-| OOM errors | Smooth generation |
-| Need multi-GPU | Single GPU works! |
+ | With V3 (ffn_chunks=16) |
+|-------------------------|
+| **900 frames @ 1920x1088** |
+| Smooth generation |
+| Single GPU works! |
 
 ## 📊 Benchmarks (RTX 4090 24GB Single GPU Version (V3))
 

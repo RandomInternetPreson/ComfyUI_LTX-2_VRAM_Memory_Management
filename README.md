@@ -1,4 +1,6 @@
-Put the respective folder into the custom_nodes folder, and restart everything.  I've only tested the code from this repo on Ubuntu usign the ComfyUI install instructions provided on their github repo.
+Put the respective folder into the custom_nodes folder, and restart everything.  
+
+I've only tested the code from this repo on Ubuntu usign the ComfyUI install instructions provided on their github repo.
 
 
 Uses V3 Single GPU

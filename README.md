@@ -2,7 +2,7 @@
 
 **Generate extremely long videos with LTX-2 on consumer GPUs!**
 
-This custom node dramatically reduces VRAM usage for LTX-2 video generation in ComfyUI, enabling 800-900+ frame videos on a single 24GB GPU.
+This custom node dramatically reduces VRAM usage for LTX-2 video generation in ComfyUI, enabling 800-900+ (at 1920x1088) frame videos on a single 24GB GPU.
 
 ## 🎬 What This Does
 
@@ -10,7 +10,7 @@ LTX-2's FeedForward layers create massive intermediate tensors that normally lim
 
 | Without This Node | With V3 (ffn_chunks=16) |
 |-------------------|-------------------------|
-| ~300 frames max | **900 frames** |
+| ~300 frames max | **900 frames ** |
 | OOM errors | Smooth generation |
 | Need multi-GPU | Single GPU works! |
 

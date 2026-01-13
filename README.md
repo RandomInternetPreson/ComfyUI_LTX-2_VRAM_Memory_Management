@@ -23,17 +23,15 @@ LTX-2's FeedForward layers create massive intermediate tensors that normally lim
 
 *Results may vary based on your system configuration*
 
+<img width="766" height="413" alt="image" src="https://github.com/user-attachments/assets/d7a6690a-612d-4239-a856-0dc2a5b18816" />
+
+
 ## 🚀 Installation
 
-1. Navigate to your ComfyUI custom nodes folder:
-   ```bash
-   cd ComfyUI/custom_nodes/
-   ```
+Copy this repo, and move the "comfyui_tensor_parallel_v2" and "comfyui_tensor_parallel_v3" folders to the customs_nodes folder
 
-2. Clone this repository:
-   ```bash
-   git clone https://github.com/RandomInternetPreson/ComfyUI_LTX-2_VRAM_Memory_Management.git
-   ```
+<img width="276" height="136" alt="image" src="https://github.com/user-attachments/assets/c8bcb9ae-505c-4e1c-93f6-9052a01a043d" />
+
 
 3. Restart ComfyUI
 
@@ -56,6 +54,7 @@ Best for most users. Works reliably with ComfyUI's memory management.
 
 ### V2 - Multi-GPU (Experimental)
 **Node name:** `Tensor Parallel V2 + Chunked FFN`
+<img width="780" height="415" alt="image" src="https://github.com/user-attachments/assets/d906d458-eb63-4371-bee3-b19a8b044da9" />
 
 For users with multiple GPUs who want faster generation. Distributes attention computation across GPUs.
 

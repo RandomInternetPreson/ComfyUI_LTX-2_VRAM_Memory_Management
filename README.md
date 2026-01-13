@@ -129,7 +129,7 @@ MIT License - Feel free to use, modify, and distribute!
 
 ## 🐛 Issues & Contributions
 
-Found a bug or have an improvement? Please open an issue or PR!
+Found a bug or have an improvement? Please open an issue or PR, I only have this running on Ubuntu so I don't know how much progress I can make on any Windows issues.
 
 This is experimental software - your feedback helps make it better for everyone.
 

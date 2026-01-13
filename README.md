@@ -32,8 +32,7 @@ Copy this repo, and move the "comfyui_tensor_parallel_v2" and "comfyui_tensor_pa
 
 <img width="276" height="136" alt="image" src="https://github.com/user-attachments/assets/c8bcb9ae-505c-4e1c-93f6-9052a01a043d" />
 
-
-3. Restart ComfyUI
+Restart everything.
 
 ## 📦 Included Nodes
 

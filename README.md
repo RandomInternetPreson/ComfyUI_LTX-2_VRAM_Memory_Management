@@ -10,7 +10,7 @@ LTX-2's FeedForward layers create massive intermediate tensors that normally lim
 
 | Without This Node | With V3 (ffn_chunks=16) |
 |-------------------|-------------------------|
-| ~300 frames max | **900 frames 1920x1088** |
+| ~300 frames max | **900 frames @ 1920x1088** |
 | OOM errors | Smooth generation |
 | Need multi-GPU | Single GPU works! |
 

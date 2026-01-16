@@ -171,7 +171,7 @@ With 7 GPUs (6 active for sequence):
 - **Implementation:** Claude (Anthropic) + RandomInternetPreson
 - **Tensor Parallelism Concepts (V2):** Inspired by [NVIDIA Megatron-LM](https://github.com/NVIDIA/Megatron-LM)
 - **Testing & Development:** RandomInternetPreson ([@RandomInternetPreson](https://github.com/RandomInternetPreson))
- @yanokusnir Got good work flow from here: https://www.reddit.com/r/StableDiffusion/comments/1qae922/ltx2_i2v_isnt_perfect_but_its_still_awesome_my/
+- **Workflow:** @yanokusnir Got good work flow from here: https://www.reddit.com/r/StableDiffusion/comments/1qae922/ltx2_i2v_isnt_perfect_but_its_still_awesome_my/
 ## 📝 License
 
 MIT License - Feel free to use, modify, and distribute!

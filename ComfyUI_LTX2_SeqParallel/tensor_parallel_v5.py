@@ -28,7 +28,7 @@ Memory per GPU:
 
 Credits:
 - Ring Attention paper: https://arxiv.org/abs/2310.01889
-- Implementation: Claude (Anthropic) with Aaron
+- Implementation: Claude (Anthropic) with RandomInternetPreson
 """
 
 import torch

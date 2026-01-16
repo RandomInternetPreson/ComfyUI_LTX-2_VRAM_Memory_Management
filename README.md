@@ -117,6 +117,55 @@ Concatenate → Full output
 Peak memory: ~0.46 GB instead of ~3.7 GB per layer!
 ```
 
+### V5 - Multi-GPU Sequence Parallelism with Ring Attention Made for I2V (NEW! You need a lot of VRAM)
+**Node name:** `Tensor Parallel V5 (Sequence Parallel + Ring Attention)`
+<img width="676" height="292" alt="image" src="https://github.com/user-attachments/assets/1d19d751-4473-45d1-bad8-7d37dfa33aa0" />
+
+
+The most advanced option for users with multiple GPUs. Splits the **sequence dimension** across GPUs using ring attention, enabling extremely long videos that would be impossible on a single GPU.
+
+**Key Innovation:** Instead of each GPU holding the full 600K+ token sequence, each GPU holds only 1/N of the tokens. Ring attention allows full self-attention computation by rotating K,V chunks around the ring.
+
+**Parameters:**
+- `num_gpus`: Number of GPUs to use (GPU 0 is excluded from sequence chunks to hold VAE/weights)
+- `verbose`: Logging level (0=quiet, 1=info, 2=debug)
+
+**Memory Distribution:**
+```
+Traditional: Each GPU needs full Q, K, V → OOM at ~400K tokens
+Ring Attention: Each GPU holds 1/N of sequence → 600K+ tokens possible!
+
+With 7 GPUs (6 active for sequence):
+  - Total sequence: ~614,400 tokens
+  - Per GPU: ~102,400 tokens
+  - Peak VRAM per GPU: ~15-18GB
+```
+
+**How Ring Attention Works:**
+1. Split sequence across N GPUs: GPU i holds tokens [i×chunk : (i+1)×chunk]
+2. Each GPU computes Q from its local tokens
+3. K,V chunks rotate around the ring (N iterations)
+4. Online softmax accumulates attention without materializing full attention matrix
+5. Result: Full self-attention with 1/N memory per GPU!
+
+**Usage:**
+```
+[Load Model] → [Tensor Parallel V5] → [Rest of workflow...]
+```
+
+**Notes:**
+- Best for Stage 2 upscaling with massive token counts
+- GPU 0 is automatically excluded from sequence distribution (holds VAE)
+- Uses float32 accumulators for numerical precision
+- Properly handles both SPLIT and INTERLEAVED RoPE modes
+
+**Requirements:**
+- Multiple NVIDIA GPUs (tested with 7× RTX 4090)
+- Works with LTXAV (audio-video) model
+
+*Ring attention enables sequences that would OOM on any single GPU!*
+
+
 ## 🙏 Credits
 
 - **Implementation:** Claude (Anthropic) + RandomInternetPreson

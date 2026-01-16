@@ -16,7 +16,7 @@ For 500 frames (S ≈ 25,000):
 
 Credits:
 - Tensor parallelism: Megatron-LM (NVIDIA)  
-- Implementation: Claude (Anthropic) with Aaron
+- Implementation: Claude (Anthropic) with RandomInternetPreson
 """
 
 import torch

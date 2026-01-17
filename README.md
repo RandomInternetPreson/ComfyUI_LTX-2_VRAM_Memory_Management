@@ -53,7 +53,7 @@ Best for most users. Works reliably with ComfyUI's memory management.
 [Load Model] → [Tensor Parallel V3] → [Rest of workflow...]
 ```
 
-### V2 - Multi-GPU (Experimental)
+### V2 - Multi-GPU (Experimental - Use V5 tensor parallelism with ring attention for multi-gpu experimentation)
 **Node name:** `Tensor Parallel V2 + Chunked FFN`
 
 <img width="780" height="415" alt="image" src="https://github.com/user-attachments/assets/d906d458-eb63-4371-bee3-b19a8b044da9" />
@@ -85,7 +85,6 @@ For users with multiple GPUs who want faster generation. Distributes attention c
    - Close other GPU applications
 
 4. **For V2 multi-GPU:**
-   - Disable ComfyUI's lowvram/offloading mode
    - Expect GPU 0 to use more memory than others
 
 ## 🔧 Compatibility
@@ -119,7 +118,7 @@ Concatenate → Full output
 Peak memory: ~0.46 GB instead of ~3.7 GB per layer!
 ```
 
-### V5 - Multi-GPU Sequence Parallelism with Ring Attention Made for I2V and T2V (NEW! You need a lot of VRAM)
+### V5 - Multi-GPU Sequence Parallelism with Ring Attention Made for I2V and T2V (NEW! You need a lot of VRAM for I2V)
 **Node name:** `Tensor Parallel V5 (Sequence Parallel + Ring Attention)`
 <img width="676" height="292" alt="image" src="https://github.com/user-attachments/assets/1d19d751-4473-45d1-bad8-7d37dfa33aa0" />
 
@@ -254,16 +253,8 @@ class ChunkedFeedForward(nn.Module):
 
 Key considerations:
 - **Chunk size selection**: Smaller chunks = lower peak memory but more kernel launches. 256-512 tokens is typically a good balance.
-- **Gradient checkpointing compatibility**: This technique composes well with gradient checkpointing for training.
-- **No accuracy loss**: The optimization is mathematically exact, not an approximation.
-
-## Results
-
-On RTX 4090 (24GB VRAM):
-- **Before**: ~81 frames maximum (VRAM limited by FFN activations)
-- **After**: 800+ frames (VRAM now limited by other factors)
-
-The 10x improvement in maximum sequence length comes directly from collapsing the FFN memory footprint from sequence-dependent to constant.
+- **It is unclear if this could be used for taining, current hypothesis is that errors would accumulate**
+- **No accuracy loss with inferencing**: The optimization is mathematically exact, not an approximation.
 
 ## Why This Wasn't Already Standard
 

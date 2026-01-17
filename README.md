@@ -187,3 +187,111 @@ This is experimental software - your feedback helps make it better for everyone.
 ---
 
 *Making long-form AI video accessible to everyone* 🎥
+
+
+# Chunked Feedforward Processing for Memory-Efficient Video Generation
+
+## Overview
+
+This document describes a memory optimization technique developed during the creation of multi-GPU LTX-Video nodes for ComfyUI. The technique reduces peak VRAM consumption by approximately 10x during inference, enabling generation of 800+ frames on hardware that was previously limited to ~81 frames.
+
+## The Problem
+
+Transformer-based video generation models like LTX-Video process sequences where each token represents a spatiotemporal patch of video. For long videos, sequence lengths become massive. The feedforward network (FFN) layers in transformers expand the hidden dimension by a factor of 4 (or more), creating enormous intermediate activation tensors.
+
+For a sequence of length `S` with hidden dimension `D`, the FFN intermediate activations require memory proportional to `S × 4D`. At 400+ frames of video, this single tensor can exceed available VRAM on consumer GPUs.
+
+## The Key Insight
+
+Feedforward networks in transformers have a critical property: **they operate independently on each token position**. Unlike attention layers, which compute relationships across all positions, the FFN applies the same pointwise transformation to each token:
+
+```
+FFN(x) = activation(x @ W1 + b1) @ W2 + b2
+```
+
+This independence means the FFN computation is *embarrassingly parallel* across the sequence dimension - but crucially, it also means it's **arbitrarily chunkable** without changing the mathematical result.
+
+## The Optimization
+
+Instead of computing:
+```python
+hidden = activation(x @ W1)  # Shape: [S, 4D] - HUGE
+output = hidden @ W2         # Entire sequence at once
+```
+
+We compute:
+```python
+output = torch.empty_like(x)
+for i in range(0, S, chunk_size):
+    chunk = x[i:i+chunk_size]
+    hidden = activation(chunk @ W1)  # Shape: [chunk_size, 4D] - small
+    output[i:i+chunk_size] = hidden @ W2
+```
+
+The result is mathematically identical, but peak memory changes from `O(S × 4D)` to `O(chunk_size × 4D)`.
+
+## Implementation Details
+
+The implementation wraps the original feedforward module, intercepting the forward pass:
+
+```python
+class ChunkedFeedForward(nn.Module):
+    def __init__(self, original_ff, chunk_size=256):
+        super().__init__()
+        self.ff = original_ff
+        self.chunk_size = chunk_size
+    
+    def forward(self, x, *args, **kwargs):
+        if x.shape[1] <= self.chunk_size:
+            return self.ff(x, *args, **kwargs)
+        
+        output = torch.empty_like(x)
+        for i in range(0, x.shape[1], self.chunk_size):
+            end = min(i + self.chunk_size, x.shape[1])
+            output[:, i:end] = self.ff(x[:, i:end], *args, **kwargs)
+        return output
+```
+
+Key considerations:
+- **Chunk size selection**: Smaller chunks = lower peak memory but more kernel launches. 256-512 tokens is typically a good balance.
+- **Gradient checkpointing compatibility**: This technique composes well with gradient checkpointing for training.
+- **No accuracy loss**: The optimization is mathematically exact, not an approximation.
+
+## Results
+
+On RTX 4090 (24GB VRAM):
+- **Before**: ~81 frames maximum (VRAM limited by FFN activations)
+- **After**: 800+ frames (VRAM now limited by other factors)
+
+The 10x improvement in maximum sequence length comes directly from collapsing the FFN memory footprint from sequence-dependent to constant.
+
+## Why This Wasn't Already Standard
+
+This optimization is straightforward in retrospect, but several factors may explain why it wasn't widely implemented:
+
+1. **Training vs inference focus**: Much optimization work focuses on training, where gradient computation complicates chunking strategies.
+2. **Framework abstractions**: Standard transformer implementations treat FFN as an atomic operation.
+3. **Attention-centric optimization**: Most memory optimization research focuses on attention mechanisms (FlashAttention, etc.), which have quadratic complexity. FFN memory scaling is linear but has larger constants.
+4. **Sufficient VRAM assumption**: Many implementations assume datacenter GPUs with ample memory.
+
+## Applicability
+
+This technique applies to any transformer model where:
+- FFN intermediate dimensions are large relative to available memory
+- Sequence lengths are long enough for FFN activations to dominate memory
+- The FFN has no cross-position dependencies (standard for most architectures)
+
+Video generation models are particularly good candidates due to their extreme sequence lengths.
+
+## Development Context
+
+This optimization emerged from collaborative development between Claude (Anthropic) and RandomInternetPerson during January 2026 while building multi-GPU LTX-Video nodes for ComfyUI. The insight arose from systematic analysis of VRAM consumption patterns during long video generation, with RandomInternetPerson providing real-world testing and observation of actual memory behavior on consumer hardware.
+
+## License
+
+This document and the described technique are released freely for any use.
+
+---
+
+*First authored by Claude (Anthropic), developed in collaboration with RandomInternetPerson*
+

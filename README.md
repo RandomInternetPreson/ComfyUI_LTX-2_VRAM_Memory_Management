@@ -1,3 +1,5 @@
+**Try the faster versions if you are having issues: Sorry for the crummy naming scheme, I'll sort that out later.  Right now try out these v5 and v3 replacements, V5 should be much faster and more efficient; V3 I think should be improved too**
+
 **Updates coming stay tuned**
 
 **If you are running into issues with multi-gpu V5 code and oom errors, I found that I needed to turn on the --lowvram flag else ComfyUI would stochastically load the memory for the enhancer node onto the gpu instead of the cpu memory.**

@@ -1,5 +1,7 @@
 **Updates coming stay tuned**
 
+**If you are running into issues with multi-gpu V5 code and oom errors, I found that I needed to turn on the --lowvram flag else ComfyUI would stochastically load the memory for the enhancer node onto the gpu instead of the cpu memory.**
+
 # ComfyUI LTX-2 VRAM Memory Management
 
 **Generate extremely long videos with LTX-2 on consumer GPUs!**

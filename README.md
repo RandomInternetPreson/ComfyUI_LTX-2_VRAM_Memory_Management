@@ -3,8 +3,9 @@
 Okay, I'll fix the naming convention later, but if you are on:
 
 - One gpu use V3; and check out the FasterVersions folder for a potentially better version
-- Two gpus; use sequence_chunked_blocks for I2V 
+- Two gpus; use sequence_chunked_blocks for I2V (might try ltx_multi_gpu_chunked)
 - Three+ gpus; use ltx_multi_gpu_chunked for I2V
+
 Not everythign is documented, try T2V with I2V nodes; I'll be doing more testing myself but these work.  I've only tested with fp8-distilled.
 
 **Try the faster versions if you are having issues: Sorry for the crummy naming scheme, I'll sort that out later.  Right now try out these v5 and v3 replacements, V5 should be much faster and more efficient; V3 I think should be improved too**

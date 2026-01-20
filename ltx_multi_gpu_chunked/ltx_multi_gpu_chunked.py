@@ -632,7 +632,7 @@ def _chunked_forward_v6(
     # ================================================================
     
     # For AV model, we need to handle both video and audio attention
-    # Audio context is small, so we can keep it in memory
+    # Audio is small (~2K tokens), so doesn't need chunking
     
     # Extract context for video/audio if AV model
     if is_av_model and isinstance(context_prepared, (list, tuple)):
@@ -642,6 +642,88 @@ def _chunked_forward_v6(
         v_context = context_prepared
         a_context = None
     
+    # Get audio tensors (small, keep on compute device)
+    # ax_storage is on first_storage, we'll move it to compute when needed
+    ax_compute = None
+    if is_av_model and ax_storage is not None and ax_storage.numel() > 0:
+        ax_compute = ax_storage.to(compute_device, non_blocking=True)
+        torch.cuda.synchronize(compute_gpu)
+    
+    # Extract audio timestep and PE from storage (audio parts are NOT chunked)
+    # timestep structure: [v_timestep, a_timestep, (av_ca_audio_ss, av_ca_video_ss, av_ca_a2v_gate, av_ca_v2a_gate)]
+    # pe structure: [(v_pe, v_cross_pe), (a_pe, a_cross_pe)]
+    
+    a_timestep = None
+    av_ca_audio_scale_shift = None
+    av_ca_video_scale_shift = None
+    av_ca_a2v_gate = None
+    av_ca_v2a_gate = None
+    a_pe = None
+    a_cross_pe = None
+    v_cross_pe_full = None  # We'll need this for cross-modal attention
+    
+    if is_av_model:
+        # Get audio timestep - it's small, stored on first storage GPU (not chunked)
+        if isinstance(timestep_storage, (list, tuple)) and len(timestep_storage) > 1:
+            a_ts_storage = timestep_storage[1]
+            if isinstance(a_ts_storage, torch.Tensor):
+                a_timestep = a_ts_storage.to(compute_device, non_blocking=True)
+            elif is_chunked_tensor_list(a_ts_storage):
+                # It was chunked, gather it (shouldn't happen for audio but just in case)
+                a_timestep = torch.cat([c.to(compute_device) for c, _, _, _, _ in a_ts_storage], dim=1)
+            torch.cuda.synchronize(compute_gpu)
+        
+        # Get cross-attention timesteps (index 2 in timestep structure)
+        if isinstance(timestep_storage, (list, tuple)) and len(timestep_storage) > 2:
+            ca_timesteps = timestep_storage[2]
+            if isinstance(ca_timesteps, (list, tuple)) and len(ca_timesteps) >= 4:
+                # These may or may not be chunked depending on their dimensions
+                def get_full_tensor(item):
+                    if item is None:
+                        return None
+                    if isinstance(item, torch.Tensor):
+                        return item.to(compute_device, non_blocking=True)
+                    if is_chunked_tensor_list(item):
+                        return torch.cat([c.to(compute_device) for c, _, _, _, _ in item], dim=1)
+                    return item
+                
+                av_ca_audio_scale_shift = get_full_tensor(ca_timesteps[0])
+                av_ca_video_scale_shift = get_full_tensor(ca_timesteps[1])
+                av_ca_a2v_gate = get_full_tensor(ca_timesteps[2])
+                av_ca_v2a_gate = get_full_tensor(ca_timesteps[3])
+                torch.cuda.synchronize(compute_gpu)
+        
+        # Get audio PE from pe_storage
+        # pe_storage structure: [(v_pe_chunked, v_cross_pe_chunked), (a_pe, a_cross_pe)]
+        if isinstance(pe_storage, (list, tuple)) and len(pe_storage) > 1:
+            a_pe_pair = pe_storage[1]  # (a_pe, a_cross_pe)
+            if isinstance(a_pe_pair, (list, tuple)) and len(a_pe_pair) >= 2:
+                a_pe_storage = a_pe_pair[0]
+                a_cross_pe_storage = a_pe_pair[1]
+                
+                def get_pe_tuple(pe_item):
+                    """Convert stored PE to (cos, sin, split) tuple on compute device."""
+                    if pe_item is None:
+                        return None
+                    if isinstance(pe_item, tuple) and len(pe_item) >= 2:
+                        # Check if already just tensors
+                        if isinstance(pe_item[0], torch.Tensor):
+                            cos = pe_item[0].to(compute_device, non_blocking=True)
+                            sin = pe_item[1].to(compute_device, non_blocking=True)
+                            split = pe_item[2] if len(pe_item) > 2 else False
+                            return (cos, sin, split)
+                        # Check if chunked
+                        if is_chunked_tensor_list(pe_item[0]):
+                            cos = torch.cat([c.to(compute_device) for c, _, _, _, _ in pe_item[0]], dim=1)
+                            sin = torch.cat([c.to(compute_device) for c, _, _, _, _ in pe_item[1]], dim=1)
+                            split = pe_item[2] if len(pe_item) > 2 else False
+                            return (cos, sin, split)
+                    return pe_item
+                
+                a_pe = get_pe_tuple(a_pe_storage)
+                a_cross_pe = get_pe_tuple(a_cross_pe_storage)
+                torch.cuda.synchronize(compute_gpu)
+    
     for block_idx, block in enumerate(self.transformer_blocks):
         if _config.verbose >= 1 and (block_idx % 8 == 0 or block_idx == len(self.transformer_blocks) - 1):
             mem = torch.cuda.memory_allocated(compute_gpu) / 1024**2
@@ -649,7 +731,9 @@ def _chunked_forward_v6(
         
         v_attn1 = block.attn1
         
-        # ---- Compute K, V for all chunks ----
+        # ============================================================
+        # PART A: Compute K, V for all video chunks
+        # ============================================================
         k_chunks = []
         v_chunks_kv = []
         ada_storage = []
@@ -719,8 +803,11 @@ def _chunked_forward_v6(
         v_full = torch.cat([v.to(first_storage) for v in v_chunks_kv], dim=1)
         del k_chunks, v_chunks_kv
         
-        # ---- Process Q for each chunk ----
-        output_chunks = []
+        # ============================================================
+        # PART B: Video self-attention + text cross-attention for each chunk
+        # (Store intermediate results - don't do FFN yet!)
+        # ============================================================
+        intermediate_vx_chunks = []
         
         for chunk_idx in range(num_chunks):
             vx_data, start, end, storage_device, storage_gpu_id = vx_chunks[chunk_idx]
@@ -743,11 +830,10 @@ def _chunked_forward_v6(
             # Apply RoPE to Q
             pe_chunk = get_pe_chunk(pe_storage, chunk_idx, compute_device, compute_gpu)
             if pe_chunk is not None:
-                # pe_chunk is [(v_pe, v_cross_pe), (a_pe, a_cross_pe)]
                 if isinstance(pe_chunk, (list, tuple)) and len(pe_chunk) > 0:
-                    v_pe_pair = pe_chunk[0]  # (v_pe, v_cross_pe)
+                    v_pe_pair = pe_chunk[0]
                     if isinstance(v_pe_pair, (list, tuple)) and len(v_pe_pair) > 0:
-                        v_pe = v_pe_pair[0]  # (cos, sin, split)
+                        v_pe = v_pe_pair[0]
                         if v_pe is not None and isinstance(v_pe, tuple) and len(v_pe) >= 2:
                             q = apply_rotary_emb(q, v_pe)
             del pe_chunk
@@ -774,7 +860,7 @@ def _chunked_forward_v6(
             vx_compute = vx_compute + attn_out * gate_msa_c
             del attn_out, scale_msa_c, shift_msa_c, gate_msa_c
             
-            # Cross-attention with text
+            # Video text cross-attention
             vx_compute = vx_compute + block.attn2(
                 comfy.ldm.common_dit.rms_norm(vx_compute),
                 context=v_context,
@@ -782,7 +868,202 @@ def _chunked_forward_v6(
                 transformer_options=transformer_options,
             )
             
-            # FFN
+            # Store intermediate (before FFN and cross-modal attention)
+            intermediate_vx_chunks.append((vx_compute.to(storage_device, non_blocking=True), start, end, storage_device, storage_gpu_id))
+            del vx_compute
+            torch.cuda.empty_cache()
+        
+        del k_full, v_full
+        
+        # ============================================================
+        # PART C: Audio self-attention + text cross-attention
+        # ============================================================
+        if is_av_model and ax_compute is not None and ax_compute.numel() > 0:
+            # Audio ada values
+            ashift_msa, ascale_msa, agate_msa = block.get_ada_values(
+                block.audio_scale_shift_table, batch_size, a_timestep, slice(0, 3)
+            )
+            
+            # Audio self-attention
+            norm_ax = comfy.ldm.common_dit.rms_norm(ax_compute) * (1 + ascale_msa) + ashift_msa
+            ax_compute = ax_compute + block.audio_attn1(
+                norm_ax, pe=a_pe, transformer_options=transformer_options
+            ) * agate_msa
+            del norm_ax, ashift_msa, ascale_msa, agate_msa
+            
+            # Audio text cross-attention
+            if a_context is not None:
+                ax_compute = ax_compute + block.audio_attn2(
+                    comfy.ldm.common_dit.rms_norm(ax_compute),
+                    context=a_context,
+                    mask=attention_mask_prepared,
+                    transformer_options=transformer_options,
+                )
+        
+        # ============================================================
+        # PART D: Cross-modal attention (a2v and v2a)
+        # ============================================================
+        if is_av_model and ax_compute is not None and ax_compute.numel() > 0:
+            run_a2v = transformer_options.get("a2v_cross_attn", True)
+            run_v2a = transformer_options.get("v2a_cross_attn", True)
+            
+            if run_a2v or run_v2a:
+                ax_norm3 = comfy.ldm.common_dit.rms_norm(ax_compute)
+                
+                # Get cross-attention ada values for audio
+                if av_ca_audio_scale_shift is not None and av_ca_v2a_gate is not None:
+                    (
+                        scale_ca_audio_a2v, shift_ca_audio_a2v,
+                        scale_ca_audio_v2a, shift_ca_audio_v2a,
+                        gate_out_v2a,
+                    ) = block.get_av_ca_ada_values(
+                        block.scale_shift_table_a2v_ca_audio,
+                        ax_compute.shape[0],
+                        av_ca_audio_scale_shift,
+                        av_ca_v2a_gate,
+                    )
+                else:
+                    run_a2v = False
+                    run_v2a = False
+                
+                # a2v: For each video chunk, add audio context
+                if run_a2v:
+                    a2v_output_chunks = []
+                    
+                    for chunk_idx in range(num_chunks):
+                        vx_data, start, end, storage_device, storage_gpu_id = intermediate_vx_chunks[chunk_idx]
+                        vx_compute = vx_data.to(compute_device, non_blocking=True)
+                        torch.cuda.synchronize(compute_gpu)
+                        
+                        vx_norm3 = comfy.ldm.common_dit.rms_norm(vx_compute)
+                        
+                        # Get chunk-specific cross PE
+                        pe_chunk = get_pe_chunk(pe_storage, chunk_idx, compute_device, compute_gpu)
+                        v_cross_pe_chunk = None
+                        if pe_chunk is not None and isinstance(pe_chunk, (list, tuple)) and len(pe_chunk) > 0:
+                            v_pe_pair = pe_chunk[0]
+                            if isinstance(v_pe_pair, (list, tuple)) and len(v_pe_pair) > 1:
+                                v_cross_pe_chunk = v_pe_pair[1]
+                        
+                        # Get video cross-attention ada values (per chunk if needed)
+                        if av_ca_video_scale_shift is not None and av_ca_a2v_gate is not None:
+                            # Check if these are per-token (have seq dimension matching full video)
+                            # If so, we need to slice them for this chunk
+                            v_ca_ss = av_ca_video_scale_shift
+                            v_ca_gate = av_ca_a2v_gate
+                            
+                            if v_ca_ss.dim() > 1 and v_ca_ss.shape[1] == v_seq_len:
+                                v_ca_ss = v_ca_ss[:, start:end]
+                            if v_ca_gate.dim() > 1 and v_ca_gate.shape[1] == v_seq_len:
+                                v_ca_gate = v_ca_gate[:, start:end]
+                            
+                            (
+                                scale_ca_video_a2v, shift_ca_video_a2v,
+                                scale_ca_video_v2a_chunk, shift_ca_video_v2a_chunk,
+                                gate_out_a2v,
+                            ) = block.get_av_ca_ada_values(
+                                block.scale_shift_table_a2v_ca_video,
+                                vx_compute.shape[0],
+                                v_ca_ss,
+                                v_ca_gate,
+                            )
+                            
+                            vx_scaled = vx_norm3 * (1 + scale_ca_video_a2v) + shift_ca_video_a2v
+                            ax_scaled = ax_norm3 * (1 + scale_ca_audio_a2v) + shift_ca_audio_a2v
+                            
+                            a2v_out = block.audio_to_video_attn(
+                                vx_scaled,
+                                context=ax_scaled,
+                                pe=v_cross_pe_chunk,
+                                k_pe=a_cross_pe,
+                                transformer_options=transformer_options,
+                            ) * gate_out_a2v
+                            
+                            vx_compute = vx_compute + a2v_out
+                            del a2v_out, vx_scaled, ax_scaled, vx_norm3
+                            del scale_ca_video_a2v, shift_ca_video_a2v, scale_ca_video_v2a_chunk, shift_ca_video_v2a_chunk, gate_out_a2v
+                        
+                        a2v_output_chunks.append((vx_compute.to(storage_device, non_blocking=True), start, end, storage_device, storage_gpu_id))
+                        del vx_compute, pe_chunk
+                        torch.cuda.empty_cache()
+                    
+                    # Replace intermediate chunks with a2v output
+                    intermediate_vx_chunks = a2v_output_chunks
+                
+                # v2a: Gather full video, add to audio
+                if run_v2a:
+                    # Gather full video temporarily
+                    vx_full_for_v2a = torch.cat([c.to(compute_device) for c, _, _, _, _ in intermediate_vx_chunks], dim=1)
+                    torch.cuda.synchronize(compute_gpu)
+                    
+                    vx_norm3_full = comfy.ldm.common_dit.rms_norm(vx_full_for_v2a)
+                    
+                    # Compute video ada values for FULL video (for v2a)
+                    (
+                        scale_ca_video_a2v_full, shift_ca_video_a2v_full,
+                        scale_ca_video_v2a, shift_ca_video_v2a,
+                        gate_out_a2v_full,
+                    ) = block.get_av_ca_ada_values(
+                        block.scale_shift_table_a2v_ca_video,
+                        vx_full_for_v2a.shape[0],
+                        av_ca_video_scale_shift,
+                        av_ca_a2v_gate,
+                    )
+                    
+                    # Get full video cross PE
+                    v_cross_pe_chunks = []
+                    for chunk_idx in range(num_chunks):
+                        pe_chunk = get_pe_chunk(pe_storage, chunk_idx, compute_device, compute_gpu)
+                        if pe_chunk is not None and isinstance(pe_chunk, (list, tuple)) and len(pe_chunk) > 0:
+                            v_pe_pair = pe_chunk[0]
+                            if isinstance(v_pe_pair, (list, tuple)) and len(v_pe_pair) > 1:
+                                v_cross_pe_chunk = v_pe_pair[1]
+                                if v_cross_pe_chunk is not None and isinstance(v_cross_pe_chunk, tuple):
+                                    v_cross_pe_chunks.append(v_cross_pe_chunk)
+                    
+                    # Concatenate video cross PE if we have chunks
+                    v_cross_pe_full = None
+                    if len(v_cross_pe_chunks) > 0:
+                        # Concatenate cos and sin separately
+                        cos_list = [pe[0] for pe in v_cross_pe_chunks if pe[0] is not None]
+                        sin_list = [pe[1] for pe in v_cross_pe_chunks if pe[1] is not None]
+                        if cos_list and sin_list:
+                            cos_full = torch.cat(cos_list, dim=2 if cos_list[0].dim() == 4 else 1)
+                            sin_full = torch.cat(sin_list, dim=2 if sin_list[0].dim() == 4 else 1)
+                            split = v_cross_pe_chunks[0][2] if len(v_cross_pe_chunks[0]) > 2 else False
+                            v_cross_pe_full = (cos_full, sin_full, split)
+                    
+                    vx_scaled_v2a = vx_norm3_full * (1 + scale_ca_video_v2a) + shift_ca_video_v2a
+                    ax_scaled_v2a = ax_norm3 * (1 + scale_ca_audio_v2a) + shift_ca_audio_v2a
+                    
+                    v2a_out = block.video_to_audio_attn(
+                        ax_scaled_v2a,
+                        context=vx_scaled_v2a,
+                        pe=a_cross_pe,
+                        k_pe=v_cross_pe_full,
+                        transformer_options=transformer_options,
+                    ) * gate_out_v2a
+                    
+                    ax_compute = ax_compute + v2a_out
+                    
+                    del vx_full_for_v2a, vx_norm3_full, vx_scaled_v2a, ax_scaled_v2a, v2a_out
+                    del scale_ca_video_a2v_full, shift_ca_video_a2v_full, scale_ca_video_v2a, shift_ca_video_v2a, gate_out_a2v_full
+                    del v_cross_pe_full, v_cross_pe_chunks
+                    torch.cuda.empty_cache()
+                
+                del ax_norm3
+                del scale_ca_audio_a2v, shift_ca_audio_a2v, scale_ca_audio_v2a, shift_ca_audio_v2a, gate_out_v2a
+        
+        # ============================================================
+        # PART E: Video FFN for each chunk
+        # ============================================================
+        output_chunks = []
+        
+        for chunk_idx in range(num_chunks):
+            vx_data, start, end, storage_device, storage_gpu_id = intermediate_vx_chunks[chunk_idx]
+            _, _, _, shift_mlp, scale_mlp, gate_mlp = ada_storage[chunk_idx]
+            
+            vx_compute = vx_data.to(compute_device, non_blocking=True)
             scale_mlp_c = scale_mlp.to(compute_device, non_blocking=True)
             shift_mlp_c = shift_mlp.to(compute_device, non_blocking=True)
             gate_mlp_c = gate_mlp.to(compute_device, non_blocking=True)
@@ -792,12 +1073,23 @@ def _chunked_forward_v6(
             vx_compute = vx_compute + block.ff(y) * gate_mlp_c
             del y, scale_mlp_c, shift_mlp_c, gate_mlp_c
             
-            # Store output
             output_chunks.append((vx_compute.to(storage_device, non_blocking=True), start, end, storage_device, storage_gpu_id))
             del vx_compute
             torch.cuda.empty_cache()
         
-        del k_full, v_full, ada_storage
+        del ada_storage, intermediate_vx_chunks
+        
+        # ============================================================
+        # PART F: Audio FFN
+        # ============================================================
+        if is_av_model and ax_compute is not None and ax_compute.numel() > 0:
+            ashift_mlp, ascale_mlp, agate_mlp = block.get_ada_values(
+                block.audio_scale_shift_table, batch_size, a_timestep, slice(3, None)
+            )
+            
+            ax_scaled = comfy.ldm.common_dit.rms_norm(ax_compute) * (1 + ascale_mlp) + ashift_mlp
+            ax_compute = ax_compute + block.audio_ff(ax_scaled) * agate_mlp
+            del ax_scaled, ashift_mlp, ascale_mlp, agate_mlp
         
         # Sync and update vx_chunks
         for gpu_id in _config.storage_gpus:
@@ -816,10 +1108,11 @@ def _chunked_forward_v6(
     torch.cuda.synchronize(compute_gpu)
     
     # Reconstruct x for _process_output
+    # NOTE: ax_compute was updated throughout the block loop, so use it directly!
     if is_av_model:
-        ax_compute = ax_storage.to(compute_device, non_blocking=True) if ax_storage is not None else None
-        torch.cuda.synchronize(compute_gpu)
-        x_final = [vx_final, ax_compute]
+        # ax_compute already has the processed audio from all transformer blocks
+        # Don't reload from ax_storage - that would lose all the audio processing!
+        x_final = [vx_final, ax_compute if ax_compute is not None else torch.empty(0, device=compute_device)]
     else:
         x_final = vx_final
     

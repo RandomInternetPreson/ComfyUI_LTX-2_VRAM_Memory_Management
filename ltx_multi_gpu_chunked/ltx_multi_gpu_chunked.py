@@ -1546,56 +1546,181 @@ def _chunked_forward_v6(
         vx_chunks = output_chunks
     
     # ================================================================
-    # STEP 6: Process output
+    # STEP 6: Process output - CHUNKED to avoid OOM on large sequences
     # ================================================================
     
     if _config.verbose >= 1:
         logger.info(f"[FORWARD] Processing output...")
     
-    # Gather vx from all chunks
-    vx_final = torch.cat([c.to(compute_device) for c, _, _, _, _ in vx_chunks], dim=1)
-    torch.cuda.synchronize(compute_gpu)
+    # For very large sequences, do output processing PER-CHUNK on storage GPUs
+    # This avoids gathering the huge full tensor to GPU0
+    # 
+    # _process_output does:
+    # 1. scale_shift_table + embedded_timestep -> scale, shift (per-token)
+    # 2. norm_out(x) (per-token)
+    # 3. x * (1 + scale) + shift (per-token)
+    # 4. proj_out(x) (per-token) - REDUCES hidden_dim from 7680 to out_channels!
+    # 5. unpatchify (needs full sequence)
+    #
+    # Steps 1-4 can be done per-chunk! Only unpatchify needs full sequence.
+    # After proj_out, tensor is MUCH smaller, so gathering is feasible.
     
-    # Reconstruct x for _process_output
-    # NOTE: ax_compute was updated throughout the block loop, so use it directly!
-    if is_av_model:
-        # ax_compute already has the processed audio from all transformer blocks
-        # Don't reload from ax_storage - that would lose all the audio processing!
-        x_final = [vx_final, ax_compute if ax_compute is not None else torch.empty(0, device=compute_device)]
-    else:
-        x_final = vx_final
-    
-    # Gather FULL embedded_timestep (not just chunk 0!)
-    def gather_nested(storage, num_chunks):
-        """Gather all chunks from nested storage structure."""
-        if storage is None:
-            return None
+    if v_seq_len > 120000:  # Only chunk for very large sequences (> ~500 frames)
+        if _config.verbose >= 1:
+            logger.info(f"[FORWARD] Using CHUNKED output processing for {v_seq_len} tokens")
         
-        # Check if this is a chunked tensor list
-        if is_chunked_tensor_list(storage):
-            # Gather all chunks
-            gathered = torch.cat([c.to(compute_device) for c, _, _, _, _ in storage], dim=1)
-            torch.cuda.synchronize(compute_gpu)
-            return gathered
+        # Process each video chunk on its storage GPU
+        processed_vx_chunks = []
         
-        elif isinstance(storage, (list, tuple)):
-            # Recurse into nested structure
-            results = [gather_nested(sub, num_chunks) for sub in storage]
-            return type(storage)(results)
+        for chunk_idx in range(num_chunks):
+            vx_data, start, end, storage_device, storage_gpu_id = vx_chunks[chunk_idx]
+            chunk_len = end - start
+            
+            # Get corresponding embedded_timestep chunk
+            if is_chunked_tensor_list(emb_ts_storage[0]):
+                # Video embedded_timestep is chunked
+                emb_ts_chunk_data, _, _, _, _ = emb_ts_storage[0][chunk_idx]
+                emb_ts_chunk = emb_ts_chunk_data  # Already on storage GPU
+            else:
+                # Not chunked, slice it
+                emb_ts_full = emb_ts_storage[0].to(storage_device)
+                emb_ts_chunk = emb_ts_full[:, start:end]
+            
+            with torch.cuda.device(storage_gpu_id):
+                # Step 1: Compute scale and shift
+                scale_shift_values = (
+                    self.scale_shift_table[None, None].to(device=storage_device, dtype=vx_data.dtype) 
+                    + emb_ts_chunk[:, :, None]
+                )
+                shift_chunk = scale_shift_values[:, :, 0]
+                scale_chunk = scale_shift_values[:, :, 1]
+                
+                # Step 2: norm_out
+                vx_normed = self.norm_out(vx_data)
+                
+                # Step 3: scale/shift modulation
+                vx_modulated = vx_normed * (1 + scale_chunk) + shift_chunk
+                
+                # Step 4: proj_out - this REDUCES the hidden dimension significantly!
+                vx_projected = self.proj_out(vx_modulated)
+                
+                # Store the small projected chunk (much smaller than original!)
+                processed_vx_chunks.append((
+                    vx_projected, start, end, storage_device, storage_gpu_id
+                ))
+                
+                del scale_shift_values, shift_chunk, scale_chunk, vx_normed, vx_modulated
+                torch.cuda.empty_cache()
         
-        elif isinstance(storage, torch.Tensor):
-            # Not chunked, just move
-            result = storage.to(compute_device, non_blocking=True)
-            torch.cuda.synchronize(compute_gpu)
-            return result
+        # Now gather the SMALL projected chunks to compute GPU
+        vx_projected_full = torch.cat([c.to(compute_device) for c, _, _, _, _ in processed_vx_chunks], dim=1)
+        torch.cuda.synchronize(compute_gpu)
         
+        # Clean up processed chunks from storage GPUs
+        for _, _, _, storage_device, storage_gpu_id in processed_vx_chunks:
+            with torch.cuda.device(storage_gpu_id):
+                torch.cuda.empty_cache()
+        del processed_vx_chunks
+        
+        # Handle keyframe masking if needed
+        if keyframe_idxs is not None:
+            grid_mask = merged_args["grid_mask"]
+            orig_patchified_shape = merged_args["orig_patchified_shape"]
+            full_x = torch.zeros(orig_patchified_shape, dtype=vx_projected_full.dtype, device=compute_device)
+            full_x[:, grid_mask, :] = vx_projected_full
+            vx_projected_full = full_x
+        
+        # Step 5: Unpatchify (on compute GPU with small tensor)
+        orig_shape = merged_args["orig_shape"]
+        vx_unpatchified = self.patchifier.unpatchify(
+            latents=vx_projected_full,
+            output_height=orig_shape[3],
+            output_width=orig_shape[4],
+            output_num_frames=orig_shape[2],
+            out_channels=orig_shape[1] // math.prod(self.patchifier.patch_size),
+        )
+        
+        del vx_projected_full
+        
+        # Process audio output (small, no chunking needed)
+        if is_av_model and ax_compute is not None and ax_compute.numel() > 0:
+            # Get audio embedded_timestep
+            if isinstance(emb_ts_storage, (list, tuple)) and len(emb_ts_storage) > 1:
+                a_emb_ts = emb_ts_storage[1]
+                if isinstance(a_emb_ts, torch.Tensor):
+                    a_emb_ts = a_emb_ts.to(compute_device)
+                elif is_chunked_tensor_list(a_emb_ts):
+                    a_emb_ts = torch.cat([c.to(compute_device) for c, _, _, _, _ in a_emb_ts], dim=1)
+            else:
+                a_emb_ts = None
+            
+            if a_emb_ts is not None:
+                # Process audio output (inline from av_model._process_output)
+                a_scale_shift_values = (
+                    self.audio_scale_shift_table[None, None].to(device=a_emb_ts.device, dtype=a_emb_ts.dtype)
+                    + a_emb_ts[:, :, None]
+                )
+                a_shift, a_scale = a_scale_shift_values[:, :, 0], a_scale_shift_values[:, :, 1]
+                
+                ax_output = self.audio_norm_out(ax_compute)
+                ax_output = ax_output * (1 + a_scale) + a_shift
+                ax_output = self.audio_proj_out(ax_output)
+                
+                # Unpatchify audio
+                ax_output = self.a_patchifier.unpatchify(
+                    ax_output, channels=self.num_audio_channels, freq=self.audio_frequency_bins
+                )
+                
+                del a_scale_shift_values, a_shift, a_scale
+            else:
+                ax_output = ax_compute
+            
+            # Recombine audio and video
+            original_shape = merged_args.get("av_orig_shape")
+            output = self.recombine_audio_and_video_latents(vx_unpatchified, ax_output, original_shape)
+            del ax_output, vx_unpatchified
         else:
-            return storage
+            output = vx_unpatchified
     
-    emb_ts_compute = gather_nested(emb_ts_storage, num_chunks)
-    
-    # Process output
-    output = self._process_output(x_final, emb_ts_compute, keyframe_idxs, **merged_args)
+    else:
+        # Original non-chunked path for smaller sequences
+        # Gather vx from all chunks
+        vx_final = torch.cat([c.to(compute_device) for c, _, _, _, _ in vx_chunks], dim=1)
+        torch.cuda.synchronize(compute_gpu)
+        
+        # Reconstruct x for _process_output
+        if is_av_model:
+            x_final = [vx_final, ax_compute if ax_compute is not None else torch.empty(0, device=compute_device)]
+        else:
+            x_final = vx_final
+        
+        # Gather FULL embedded_timestep
+        def gather_nested(storage, num_chunks):
+            """Gather all chunks from nested storage structure."""
+            if storage is None:
+                return None
+            
+            if is_chunked_tensor_list(storage):
+                gathered = torch.cat([c.to(compute_device) for c, _, _, _, _ in storage], dim=1)
+                torch.cuda.synchronize(compute_gpu)
+                return gathered
+            
+            elif isinstance(storage, (list, tuple)):
+                results = [gather_nested(sub, num_chunks) for sub in storage]
+                return type(storage)(results)
+            
+            elif isinstance(storage, torch.Tensor):
+                result = storage.to(compute_device, non_blocking=True)
+                torch.cuda.synchronize(compute_gpu)
+                return result
+            
+            else:
+                return storage
+        
+        emb_ts_compute = gather_nested(emb_ts_storage, num_chunks)
+        
+        # Process output
+        output = self._process_output(x_final, emb_ts_compute, keyframe_idxs, **merged_args)
     
     if _config.verbose >= 1:
         mem = torch.cuda.memory_allocated(compute_gpu) / 1024**2
@@ -1605,10 +1730,16 @@ def _chunked_forward_v6(
     # CRITICAL CLEANUP: Free all intermediate tensors to prevent OOM on next pass
     # ================================================================
     
-    # Delete chunk storage
-    del vx_chunks, vx_final
-    if 'x_final' in dir():
+    # Delete chunk storage (vx_final only exists in non-chunked path)
+    del vx_chunks
+    try:
+        del vx_final
+    except NameError:
+        pass  # vx_final doesn't exist in chunked output path
+    try:
         del x_final
+    except NameError:
+        pass
     
     # Delete timestep storage
     def delete_nested(storage):

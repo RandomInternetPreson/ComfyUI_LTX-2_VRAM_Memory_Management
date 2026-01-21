@@ -3,7 +3,7 @@
 Okay, I'll fix the naming convention later, but if you are on:
 
 - One gpu use V3; and check out the FasterVersions folder for a potentially better version
-- Two gpus; use sequence_chunked_blocks for I2V ** try ltx_multi_gpu_chunked**
+- Two gpus; use sequence_chunked_blocks for I2V **try ltx_multi_gpu_chunked**
 - Three+ gpus; use ltx_multi_gpu_chunked for I2V, I've done little testing but have managed 1000 I2V frames at 1920x1080
 
 This code finally does what I set out to do originally, make something that gives me more frames as a function of the amount of vram I have, even if split among gpus.  Not all features documented, I will do more testing and updates later.

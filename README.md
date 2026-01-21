@@ -1,13 +1,11 @@
-**Update** **Update**
+**Update**
 
 Okay, I'll fix the naming convention later, but if you are on:
 
 - One gpu use V3; and check out the FasterVersions folder for a potentially better version
 - Two gpus; use sequence_chunked_blocks for I2V **try ltx_multi_gpu_chunked**
 - Three+ gpus; use ltx_multi_gpu_chunked for I2V, I've done little testing but have managed 1000 I2V frames at 1920x1080
-- 
-**Update** **Update**
-
+  
 
 This code finally does what I set out to do originally, make something that gives me more frames as a function of the amount of vram I have, even if split among gpus.  Not all features documented, I will do more testing and updates later.
 
@@ -16,7 +14,6 @@ Not everything is documented, try T2V with I2V nodes; I'll be doing more testing
 **Update on Issue Submission**
 
 I will try to address issues, but I am very new to ComfyUI and this code is in a state of flux.  Trust me, you likely know ComfyUI better than I.  Give me a few days to sort out the repo and provide better documentation.
-
 
 
 **Try the faster versions if you are having issues: Sorry for the crummy naming scheme, I'll sort that out later.  Right now try out these v5 and v3 replacements, V5 should be much faster and more efficient; V3 I think should be improved too**

@@ -1,3 +1,11 @@
+**1-24-2026 Update**
+
+Kijai has implemented a FFN chunking node AND made huge improvments in the how the vram is utilized in ComfyUI - today I installed the latest nightly build of ComfyUI on Ubuntu and it works so well my nodes are no longer needed.
+
+Update to the nightly version of ComfyUI (or install it in a separate environment). I think for the time being you need to install from the git repository rather than using the portable version's update; I am not certain, as I do not use the portable version.
+
+https://github.com/kijai/ComfyUI-KJNodes
+
 **Update**
 
 Okay, I'll fix the naming convention later, but if you are on:
